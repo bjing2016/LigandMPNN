@@ -243,14 +243,20 @@ class ProteinMPNN(torch.nn.Module):
             mask = mask.repeat(B_decoder, 1)
             bias = bias.repeat(B_decoder, 1, 1)
 
+            # Size the decode buffers by the actual post-repeat batch, not
+            # B_decoder. With a single input structure these are equal, but when a
+            # true batch of B_input structures is passed (batch_size=1), the decode
+            # batch is B_input*B_decoder = h_V.shape[0]; using B_decoder would
+            # mis-size the buffers and the per-step scatter fails.
+            B_out = h_V.shape[0]
             all_probs = torch.zeros(
-                (B_decoder, L, 20), device=device, dtype=torch.float32
+                (B_out, L, 20), device=device, dtype=torch.float32
             )
             all_log_probs = torch.zeros(
-                (B_decoder, L, 21), device=device, dtype=torch.float32
+                (B_out, L, 21), device=device, dtype=torch.float32
             )
             h_S = torch.zeros_like(h_V, device=device)
-            S = 20 * torch.ones((B_decoder, L), dtype=torch.int64, device=device)
+            S = 20 * torch.ones((B_out, L), dtype=torch.int64, device=device)
             h_V_stack = [h_V] + [
                 torch.zeros_like(h_V, device=device)
                 for _ in range(len(self.decoder_layers))
@@ -393,14 +399,20 @@ class ProteinMPNN(torch.nn.Module):
             mask = mask.repeat(B_decoder, 1)
             bias = bias.repeat(B_decoder, 1, 1)
 
+            # Size the decode buffers by the actual post-repeat batch, not
+            # B_decoder. With a single input structure these are equal, but when a
+            # true batch of B_input structures is passed (batch_size=1), the decode
+            # batch is B_input*B_decoder = h_V.shape[0]; using B_decoder would
+            # mis-size the buffers and the per-step scatter fails.
+            B_out = h_V.shape[0]
             all_probs = torch.zeros(
-                (B_decoder, L, 20), device=device, dtype=torch.float32
+                (B_out, L, 20), device=device, dtype=torch.float32
             )
             all_log_probs = torch.zeros(
-                (B_decoder, L, 21), device=device, dtype=torch.float32
+                (B_out, L, 21), device=device, dtype=torch.float32
             )
             h_S = torch.zeros_like(h_V, device=device)
-            S = 20 * torch.ones((B_decoder, L), dtype=torch.int64, device=device)
+            S = 20 * torch.ones((B_out, L), dtype=torch.int64, device=device)
             h_V_stack = [h_V] + [
                 torch.zeros_like(h_V, device=device)
                 for _ in range(len(self.decoder_layers))

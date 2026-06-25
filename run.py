@@ -23,6 +23,12 @@ from model_utils import ProteinMPNN
 from prody import writePDB
 from sc_utils import Packer, pack_side_chains
 
+# Cache of built models across in-process main() calls, keyed by
+# (model_type, checkpoint_path, model class, side-chain-context, device). Repeated
+# invocations (e.g. Promera's per-backbone CDR redesign) otherwise reload the
+# checkpoint and rebuild the model every call, leaving the GPU idle.
+_MODEL_CACHE = {}
+
 
 def main(args) -> None:
     """
@@ -64,32 +70,44 @@ def main(args) -> None:
     else:
         print("Choose one of the available models")
         sys.exit()
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    if args.model_type == "ligand_mpnn":
-        atom_context_num = checkpoint["atom_context_num"]
-        ligand_mpnn_use_side_chain_context = args.ligand_mpnn_use_side_chain_context
-        k_neighbors = checkpoint["num_edges"]
-    else:
-        atom_context_num = 1
-        ligand_mpnn_use_side_chain_context = 0
-        k_neighbors = checkpoint["num_edges"]
-
-    model = ProteinMPNN(
-        node_features=128,
-        edge_features=128,
-        hidden_dim=128,
-        num_encoder_layers=3,
-        num_decoder_layers=3,
-        k_neighbors=k_neighbors,
-        device=device,
-        atom_context_num=atom_context_num,
-        model_type=args.model_type,
-        ligand_mpnn_use_side_chain_context=ligand_mpnn_use_side_chain_context,
+    _cache_key = (
+        args.model_type,
+        checkpoint_path,
+        ProteinMPNN,
+        int(args.ligand_mpnn_use_side_chain_context),
+        str(device),
     )
+    _cached = None if os.environ.get("LIGANDMPNN_NO_CACHE") else _MODEL_CACHE.get(_cache_key)
+    if _cached is None:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if args.model_type == "ligand_mpnn":
+            atom_context_num = checkpoint["atom_context_num"]
+            ligand_mpnn_use_side_chain_context = args.ligand_mpnn_use_side_chain_context
+            k_neighbors = checkpoint["num_edges"]
+        else:
+            atom_context_num = 1
+            ligand_mpnn_use_side_chain_context = 0
+            k_neighbors = checkpoint["num_edges"]
 
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-    model.eval()
+        model = ProteinMPNN(
+            node_features=128,
+            edge_features=128,
+            hidden_dim=128,
+            num_encoder_layers=3,
+            num_decoder_layers=3,
+            k_neighbors=k_neighbors,
+            device=device,
+            atom_context_num=atom_context_num,
+            model_type=args.model_type,
+            ligand_mpnn_use_side_chain_context=ligand_mpnn_use_side_chain_context,
+        )
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device)
+        model.eval()
+        _MODEL_CACHE[_cache_key] = (model, atom_context_num)
+    else:
+        model, atom_context_num = _cached
 
     if args.pack_side_chains:
         model_sc = Packer(
@@ -672,6 +690,154 @@ def main(args) -> None:
                                 seq_out_str,
                             )
                         )
+
+
+def _get_cached_model(args, device):
+    """Load (or reuse) the MPNN model for the design path; see _MODEL_CACHE."""
+    if args.model_type == "protein_mpnn":
+        checkpoint_path = args.checkpoint_protein_mpnn
+    elif args.model_type == "soluble_mpnn":
+        checkpoint_path = args.checkpoint_soluble_mpnn
+    elif args.model_type == "ligand_mpnn":
+        checkpoint_path = args.checkpoint_ligand_mpnn
+    else:
+        raise ValueError(f"design_batched: unsupported model_type {args.model_type}")
+    key = (
+        args.model_type,
+        checkpoint_path,
+        ProteinMPNN,
+        int(args.ligand_mpnn_use_side_chain_context),
+        str(device),
+    )
+    cached = _MODEL_CACHE.get(key)
+    if cached is None:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        atom_context_num = (
+            checkpoint["atom_context_num"] if args.model_type == "ligand_mpnn" else 1
+        )
+        model = ProteinMPNN(
+            node_features=128,
+            edge_features=128,
+            hidden_dim=128,
+            num_encoder_layers=3,
+            num_decoder_layers=3,
+            k_neighbors=checkpoint["num_edges"],
+            device=device,
+            atom_context_num=atom_context_num,
+            model_type=args.model_type,
+            ligand_mpnn_use_side_chain_context=args.ligand_mpnn_use_side_chain_context,
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device)
+        model.eval()
+        _MODEL_CACHE[key] = (model, atom_context_num)
+    return _MODEL_CACHE[key]
+
+
+def design_batched(args, protein_dicts, redesigned_list, fixed_list):
+    """In-memory, GPU-batched CDR redesign for the design path (no PDB I/O).
+
+    protein_dicts: list of parse_PDB-style dicts already on the GPU, each with
+        X [L,4,3], S [L], mask [L], R_idx [L], chain_labels [L], chain_letters
+        (list[str], len L) and mask_c (list of [L] bool tensors).
+    redesigned_list / fixed_list: per-structure space-joined "<chain><resnum>"
+        token strings (exactly one of each pair is non-empty), matching run.main.
+
+    All B structures are padded to the longest and stacked, so a single
+    model.sample() processes the whole batch at once. Returns one chain-separated
+    (fasta_seq_separation-joined) sequence string per input structure.
+    """
+    device = next(iter(protein_dicts[0].values())).device
+    seed = args.seed if args.seed else int(np.random.randint(0, 99999))
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    model, atom_context_num = _get_cached_model(args, device)
+
+    omit_AA = torch.tensor(
+        np.array([AA in args.omit_AA for AA in alphabet]).astype(np.float32),
+        device=device,
+    )
+    chains_to_design = (
+        args.chains_to_design.split(",") if args.chains_to_design else None
+    )
+
+    feats = []
+    for pd, redes, fix in zip(protein_dicts, redesigned_list, fixed_list):
+        encoded = [
+            f"{c}{int(r)}"
+            for c, r in zip(pd["chain_letters"], pd["R_idx"].cpu().numpy())
+        ]
+        if chains_to_design is None:
+            chain_mask = torch.ones(len(encoded), device=device)
+        else:
+            chain_mask = torch.tensor(
+                [c in chains_to_design for c in pd["chain_letters"]],
+                device=device,
+                dtype=torch.float32,
+            )
+        redes_set = set(redes.split()) if redes else set()
+        fix_set = set(fix.split()) if fix else set()
+        if redes_set:
+            keep = torch.tensor(
+                [float(e not in redes_set) for e in encoded], device=device
+            )
+            pd["chain_mask"] = chain_mask * (1 - keep)
+        elif fix_set:
+            keep = torch.tensor(
+                [float(e not in fix_set) for e in encoded], device=device
+            )
+            pd["chain_mask"] = chain_mask * keep
+        else:
+            pd["chain_mask"] = chain_mask
+        feats.append(
+            featurize(
+                pd,
+                cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
+                use_atom_context=args.ligand_mpnn_use_atom_context,
+                number_of_ligand_atoms=atom_context_num,
+                model_type=args.model_type,
+            )
+        )
+
+    N = len(feats)
+    Lmax = max(fd["X"].shape[1] for fd in feats)
+
+    def padcat(key):
+        outs = []
+        for fd in feats:
+            t = fd[key]
+            if t.shape[1] < Lmax:
+                shp = list(t.shape)
+                shp[1] = Lmax - t.shape[1]
+                t = torch.cat([t, torch.zeros(shp, dtype=t.dtype, device=t.device)], 1)
+            outs.append(t)
+        return torch.cat(outs, 0)
+
+    batched = {k: padcat(k) for k in ["X", "S", "mask", "chain_mask", "R_idx", "chain_labels"]}
+    batched["batch_size"] = 1
+    batched["temperature"] = args.temperature
+    batched["bias"] = (-1e8 * omit_AA[None, None, :]).repeat([N, Lmax, 1])
+    batched["symmetry_residues"] = [[]]
+    batched["symmetry_weights"] = [[]]
+    batched["randn"] = torch.randn([N, Lmax], device=device)
+
+    with torch.no_grad():
+        out = model.sample(batched)
+    S_out = out["S"]  # [N, Lmax]
+
+    results = []
+    for i, pd in enumerate(protein_dicts):
+        Li = pd["X"].shape[0]
+        seq_np = np.array(
+            [restype_int_to_str[int(a)] for a in S_out[i, :Li].cpu().numpy()]
+        )
+        parts = [
+            "".join(seq_np[mc.cpu().numpy()]) for mc in pd["mask_c"]
+        ]
+        results.append(args.fasta_seq_separation.join(parts))
+    return results
 
 
 if __name__ == "__main__":
